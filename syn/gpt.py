@@ -147,27 +147,38 @@ class TokenUsage():
             self.usage_by_model['total'] = BasicTokenUsage()
 
 class GPTClient:
-    def __init__(self, provider: APIProvider = APIProvider.openai, api_key: Optional[str] = None, base_url: Optional[str] = None):
+    def __init__(self, provider: APIProvider = APIProvider.openai, api_key: Optional[str] = None, base_url: Optional[str] = None, 
+                 azure_endpoint: Optional[str] = None, azure_api_version: Optional[str] = None, azure_extra_headers: Optional[Dict[str, Any]] = None):
 
-        match provider:
-            case APIProvider.openai:
-                http_client = httpx.AsyncClient(verify=False)
-                resolved_api_key = api_key or os.environ.get('OPENAI_API_KEY') or 'dummy'
-                resolved_base_url = base_url or os.environ.get('OPENAI_API_BASE')
-                self._client = AsyncOpenAI(
-                    api_key=resolved_api_key,
-                    base_url=resolved_base_url,
-                    http_client=http_client
-                )
-            case _:
-                raise ValueError(f"Unsupported API provider: {provider}")
+        self._provider = provider
+        self._api_key = api_key
+        self._base_url = base_url
+        self._azure_endpoint = azure_endpoint
+        self._azure_api_version = azure_api_version
+        self._azure_extra_headers = azure_extra_headers or {}
 
         self.token_usage = TokenUsage()
         self._max_retry_num = 3
         self._retry_delay_seconds = 1
-                
-        
 
+    def _build_client(self):
+        if self._provider == APIProvider.openai:
+            http_client = httpx.AsyncClient(verify=False)
+            resolved_api_key = self._api_key or os.environ.get('OPENAI_API_KEY') or 'dummy'
+            resolved_base_url = self._base_url or os.environ.get('OPENAI_API_BASE')
+            return AsyncOpenAI(api_key=resolved_api_key, base_url=resolved_base_url, http_client=http_client)
+        elif self._provider == APIProvider.azure:
+            resolved_api_key = self._api_key or os.environ.get('AZURE_OPENAI_API_KEY') or 'dummy'
+            resolved_endpoint = self._azure_endpoint or os.environ.get('AZURE_OPENAI_ENDPOINT') or 'https://search.bytedance.net/gpt/openapi/online/v2/crawl'
+            resolved_api_version = self._azure_api_version or os.environ.get('AZURE_OPENAI_API_VERSION') or '2024-03-01-preview'
+            return AsyncAzureOpenAI(
+                api_key=resolved_api_key,
+                azure_endpoint=resolved_endpoint,
+                api_version=resolved_api_version,
+                default_headers=self._azure_extra_headers
+            )
+        else:
+            raise ValueError(f"Unsupported API provider: {self._provider}")
 
     def _obj_to_plain(self, obj: Any) -> Any:
         if obj is None or isinstance(obj, (str, int, float, bool)):
@@ -233,16 +244,26 @@ class GPTClient:
             params["temperature"] = temperature
         if max_completion_tokens is not None:
             params["max_completion_tokens"] = max_completion_tokens
+        timeout = kwargs.get("timeout")
+        if timeout is not None:
+            params["timeout"] = timeout
+        # 新增：透传 response_format（json_mode 时会设置）
+        if "response_format" in kwargs and kwargs["response_format"] is not None:
+            params["response_format"] = kwargs["response_format"]
 
         last_error = None
         retry_delay = self._retry_delay_seconds  # seconds
         
         for attempt in range(self._max_retry_num):
             try:
-                raw: ChatCompletion = await self._client.chat.completions.create(**params)
+                # 每次调用按当前事件循环创建客户端，避免跨线程/跨事件循环复用
+                client = self._build_client()
+                raw: ChatCompletion = await client.chat.completions.create(**params)
+                print(f"raw: {raw}")
                 if stat_token_usage:
                     self.token_usage.stat_token_usage(raw)
-                if attempt > 0: logger.info(f"Retry {attempt + 1}/{self._max_retry_num} succeeded")
+                if attempt > 0:
+                    logger.info(f"Retry {attempt + 1}/{self._max_retry_num} succeeded")
                 return self._wrap_response(raw)
             except (BadRequestError, InternalServerError) as e:
                 cf_results = {}
@@ -255,27 +276,27 @@ class GPTClient:
                     pass
                 logger.error(f"Error in GPT request: {e}, code: {code}, content_filter_result: {cf_results}, return refusal completion")
                 last_error = e
-                # Check if it's a connection error and we have retries left
                 if attempt < self._max_retry_num - 1:
                     logger.warning(f"BadRequestError, InternalServerError on attempt {attempt + 1}/{self._max_retry_num}: {e}. Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    retry_delay *= 2
                     continue
-            
             except Exception as e:
                 logger.error(f"Error in GPT request: {e}")
                 last_error = e
-                # Check if it's a connection error and we have retries left
                 if attempt < self._max_retry_num - 1:
                     logger.warning(f"Connection error on attempt {attempt + 1}/{self._max_retry_num}: {e}. Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    retry_delay *= 2
                     continue
                 else:
                     break
+            finally:
+                try:
+                    await client.close()
+                except Exception as close_err:
+                    logger.warning(f"Failed to close GPT client cleanly: {close_err}")
 
-        
-        # Max retries exceeded, return refusal completion instead of raising
         logger.error(f"Max retries exceeded. Last error: {last_error}")
         return self._build_refusal_completion(model, {"error": f"Max retries exceeded: {str(last_error)}"})
 
@@ -296,8 +317,7 @@ class GPTClient:
                 messages = [system_message] + messages
             else:
                 messages[0] = system_message
-            messages[-1]["response_format"] = "json_object"
-
+            kwargs["response_format"] = {"type": "json_object"}
         return await self._call_async(messages, model, temperature, max_completion_tokens, stat_token_usage, **kwargs)
     
     @stat_time
@@ -356,22 +376,31 @@ class GPTClient:
         json_mode: bool = False,
         stat_token_usage: bool = True,
     ) -> List[ChatCompletionFallback]:
-        tasks = []
-        for req in requests:
-            task = self.send_request(
-                req["messages"],
-                req.get("model", "gpt-4.1-mini"),
-                req.get("temperature"),
-                req.get("max_completion_tokens"),
-                json_mode=json_mode,
-                stat_token_usage=req.get("stat_token_usage", stat_token_usage),
-                **{k: v for k, v in req.items() if k not in ("messages", "model", "temperature", "max_completion_tokens", "stat_token_usage")},
-            )
-            tasks.append(task)
-        
+        # Concurrency guard to avoid overwhelming the client
+        max_concurrency = 8
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def run_one(req: Dict[str, Any]) -> ChatCompletionFallback:
+            async with semaphore:
+                # Pass through per-request timeout (if provided) to the OpenAI client
+                return await self.send_request(
+                    req["messages"],
+                    req.get("model", "gpt-4.1-mini"),
+                    req.get("temperature"),
+                    req.get("max_completion_tokens"),
+                    json_mode=json_mode,
+                    stat_token_usage=req.get("stat_token_usage", stat_token_usage),
+                    **{k: v for k, v in req.items() if k not in ("messages", "model", "temperature", "max_completion_tokens", "stat_token_usage")},
+                )
+
+        tasks = [asyncio.create_task(run_one(req)) for req in requests]
+
         if progress_bar:
-            # Use tqdm.asyncio for async progress bar
-            return await tqdm.gather(*tasks, desc="Processing requests")
+            # Render progress using as_completed to avoid gather deadlocks
+            results: list[ChatCompletionFallback] = []
+            for fut in tqdm.as_completed(tasks, total=len(tasks), desc="Processing requests"):
+                results.append(await fut)
+            return results
         else:
             return await asyncio.gather(*tasks)
 

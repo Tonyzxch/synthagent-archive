@@ -11,6 +11,7 @@ from syn.consts import (
 
 class APIProvider(Enum):
     openai = "openai"
+    azure = "azure"
 
 @dataclass
 class BrowserConfig:
@@ -68,12 +69,25 @@ class GPTConfig:
     provider: APIProvider = APIProvider.openai
     openai_api_base: str = "https://api.openai.com/v1"
     openai_api_key: str = "dummy"
+    # Azure OpenAI specific configurations
+    azure_endpoint: str = ""
+    azure_api_version: str = "2024-03-01-preview"
+    azure_api_key: str = ""
+    azure_extra_headers: dict = field(default_factory=dict)
 
     def pre_process(self):
         import os        
         if self.provider == APIProvider.openai:
             os.environ['OPENAI_API_BASE'] = self.openai_api_base
             os.environ['OPENAI_API_KEY'] = self.openai_api_key
+        elif self.provider == APIProvider.azure:
+            # Azure OpenAI configuration
+            if self.azure_endpoint:
+                os.environ['AZURE_OPENAI_ENDPOINT'] = self.azure_endpoint
+            if self.azure_api_version:
+                os.environ['AZURE_OPENAI_API_VERSION'] = self.azure_api_version
+            if self.azure_api_key:
+                os.environ['AZURE_OPENAI_API_KEY'] = self.azure_api_key
 
         self.model = GPTConfig.model_map(self.model, get_simplified=False)
 
@@ -123,9 +137,10 @@ class ExploreConfig:
     target_env: str = "reddit" # choose from "shopping", "reddit", "shopping_admin", "gitlab", "map"
     target_start_url: str | None = None
     target_env_description: str | None = None
+    allow_external_urls: bool = False
 
     # exploration config
-    max_iteration: int = 128
+    max_iteration: int = 1
     max_ele_for_sampling: int = 10 # max number of elements to sample for interaction
     max_ele_per_category: int = 3  # max number of elements to execute per category
 
@@ -175,18 +190,25 @@ class ExploreConfig:
     def post_process(self):
         import os
         from loguru import logger
-        assert self.target_env in ["shopping", "reddit", "shopping_admin", "gitlab", "map"], "Invalid target environment"
-        if self.target_env_description is None:
-            self.target_env_description = {
-                "shopping": const_web_description_shopping,
-                "reddit": const_web_description_reddit,
-                "gitlab": const_web_description_gitlab,
-                "shopping_admin": const_web_description_shopping_admin,
-                "map": const_web_description_openstreetmap,
-            }[self.target_env]
+        allowed_envs = ["shopping", "reddit", "shopping_admin", "gitlab", "map"]
+        if self.target_env in allowed_envs:
+            if self.target_env_description is None:
+                self.target_env_description = {
+                    "shopping": const_web_description_shopping,
+                    "reddit": const_web_description_reddit,
+                    "gitlab": const_web_description_gitlab,
+                    "shopping_admin": const_web_description_shopping_admin,
+                    "map": const_web_description_openstreetmap,
+                }[self.target_env]
+        else:
+            if self.target_env_description is None:
+                self.target_env_description = "Open web environment (custom)."
         
-        self.target_start_url = os.environ[self.target_env.upper()]
-
+        if not isinstance(self.target_start_url, str) or len(self.target_start_url.strip()) == 0:
+            if self.target_env in allowed_envs:
+                self.target_start_url = os.environ[self.target_env.upper()]
+            else:
+                raise ValueError("target_start_url must be provided when using a custom target_env")
         logger.info(f"Target start URL is set to {self.target_start_url} for environment {self.target_env}")
 
 

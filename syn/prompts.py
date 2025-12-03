@@ -359,8 +359,12 @@ def prompt_osgenesis_generate_high_level_task(
     new_state_screenshot: "np.ndarray",
 ) -> list[dict]:
     
-    task_examples = const_web_task_examples[website_name]
-    task_examples = '\n'.join('- ' + example for example in task_examples)
+    if website_name != "custom":
+        task_examples = const_web_task_examples[website_name]
+        task_examples = '\n'.join('- ' + example for example in task_examples)
+    else:
+        task_examples = [const_web_task_examples[key][0] for key in const_web_task_examples.keys()]
+        task_examples = '\n'.join('- ' + example for example in task_examples)
     
     prompt = f"""You are a GUI (Graphical User Interface) expert capable of analyzing interface changes and envisioning executable tasks or instructions. Given a GUI interface change caused by an action (e.g., clicking or typing) and the corresponding element highlighted in red boxes, you are required to analyze the interface and generate related tasks.
 

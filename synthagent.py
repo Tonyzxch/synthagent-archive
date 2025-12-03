@@ -229,7 +229,12 @@ class SynthAgent(Explorer):
 
         tasks = [[None, None] for _ in range(len(batch_message))]
 
-        for idx, response in enumerate(self.gpt_client.batch_requests(batch_message, json_mode=True)):
+        for idx, req in enumerate(batch_message):
+            response = self.gpt_client.request(
+                req["messages"],
+                json_mode=True,
+                **self.config.gpt.__dict__ | {'max_completion_tokens': 1024},
+            )
             try:
                 response_text = response.message.content
                 data = json.loads(response_text)
@@ -340,7 +345,7 @@ class SynthAgent(Explorer):
                     if task.action.target_element:
                         self.unclick_elem_pool.add(hash_item)
 
-                elif not tools_is_local_url(next_state.raw_state.url):
+                elif (not self.config.allow_external_urls) and (not tools_is_local_url(next_state.raw_state.url)):
                     logger.info(f"page change detected, however leading to external url={next_state.raw_state.url}, skipping interaction.")
                     if task.action.target_element:
                         self.unclick_elem_pool.add(hash_item)

@@ -31,6 +31,7 @@ from syn.tools import (
 )
 from collections import defaultdict
 from loguru import logger
+from syn.args import APIProvider
 
 class Explorer:    
     def __init__(
@@ -39,7 +40,14 @@ class Explorer:
     ):
         self.config = config
 
-        self.gpt_client =  GPTClient(provider=self.config.gpt.provider)
+        self.gpt_client =  GPTClient(
+            provider=self.config.gpt.provider,
+            api_key=self.config.gpt.openai_api_key if self.config.gpt.provider == APIProvider.openai else self.config.gpt.azure_api_key,
+            base_url=self.config.gpt.openai_api_base if self.config.gpt.provider == APIProvider.openai else None,
+            azure_endpoint=self.config.gpt.azure_endpoint if self.config.gpt.provider == APIProvider.azure else None,
+            azure_api_version=self.config.gpt.azure_api_version if self.config.gpt.provider == APIProvider.azure else None,
+            azure_extra_headers=self.config.gpt.azure_extra_headers if self.config.gpt.provider == APIProvider.azure else None
+        )
 
         self.exploration_traj_save_db: list[ExplorationTraj] = []
         self.db_status = {
