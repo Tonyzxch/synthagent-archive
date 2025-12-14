@@ -330,12 +330,27 @@ class Explorer:
             # Close all tabs except the first one
             for i in range(num_tabs - 1, 0, -1):  # Close from last to second tab
                 try:
-                    env.step(create_page_focus_action(i))  # Focus on tab i
-                    env.step(create_page_close_action())   # Close the focused tab
+                    # 用 playwright 原生方法关闭，不走 webarena的 action 步骤，避免潜在的问题
+                    env.context.pages[i].close()
+                    # env.step(create_page_focus_action(i))  # Focus on tab i
+                    # env.step(create_page_close_action())   # Close the focused tab
                     logger.debug(f"Closed tab {i}")
                 except Exception as e:
                     logger.warning(f"Failed to close tab {i}: {e}")
             
+            # 如果没有标签页了，新建一个
+            if len(env.context.pages) == 0:
+                logger.warning("No open tabs found (0 tabs)! Calling env.reset() to fully restore.")
+                # 调用 env.reset 会重新初始化一切，包括 page.client
+                obs, info = self._reset_env(env, start_url=seed_url, require_login=self.config.env.auto_login)
+                # reset_env 内部已经处理了跳转和 info 获取，直接返回
+                info_meta = info['observation_metadata']
+                return self._get_env_state(env, obs, info_meta)
+            
+            # 如果还有标签页，走正常流程
+            env.page = env.context.pages[0]
+            env.page.bring_to_front()
+
             # Navigate the remaining tab (tab 0) to the seed URL
             obs, _, _, _, info = env.step(create_goto_url_action(seed_url))
             logger.info(f"Reset all tabs and navigated to seed URL: {seed_url}")
@@ -372,8 +387,14 @@ class Explorer:
 
         observation, info = env.reset(options={'config_file': f"{self.config.output}/init_env.json"})
 
-        env.context.set_default_timeout(120000)
-        env.context.set_default_navigation_timeout(120000)
+        # 自动授权地理位置
+        try:
+            env.context.grant_permissions(["geolocation"]) 
+        except Exception as e:
+            logger.warning(f"Failed to grant permissions: {e}")
+
+        env.context.set_default_timeout(5000)
+        env.context.set_default_navigation_timeout(5000)
 
         return observation, info
 
@@ -507,7 +528,22 @@ class Explorer:
             info = {'observation_metadata': observation_metadata}
         
         else:
-            obs, _, _, _, info = env.step(create_id_based_action(task.action.get_action_str()))
+            from browser_env.actions import ActionTypes
+            
+            # 检查是否是 TYPE 动作且包含非 ASCII 字符（如中文）
+            if task.action.action_type == ActionType.TYPE and any(ord(c) > 127 for c in task.action.value):
+                # 手动构建 Action 字典，绕过 webarena 的 _keys2ids 检查
+                # 注意：这需要确保 webarena 开启了 fill_instead_of_type (默认开启)
+                action_payload = {
+                    "action_type": ActionTypes.TYPE,
+                    "element_id": int(task.action.target_element.id),
+                    "text": task.action.value,
+                    "key_comb": ""
+                }
+                obs, _, _, _, info = env.step(action_payload)
+            else:
+                obs, _, _, _, info = env.step(create_id_based_action(task.action.get_action_str()))
+            
             time.sleep(self.config.sleep_after_action)
 
         task.action.status = ActionExecuteStatus.SUCCESS
@@ -530,12 +566,21 @@ class Explorer:
             
             for tab_index in reversed(tabs_to_close):
                 try:
-                    env.step(create_page_focus_action(tab_index))
-                    env.step(create_page_close_action())
+                    # 用 playwright 原生方法关闭，不走 webarena的 action 步骤，避免潜在的问题
+                    env.context.pages[tab_index].close()
+                    # env.step(create_page_focus_action(tab_index))
+                    # env.step(create_page_close_action())
                     logger.info(f"Closed non-localhost tab {tab_index}")
                 except Exception as e:
                     logger.error(f"Failed to close tab {tab_index}: {e}")
             
+            # 如果当前页面被关了，切回活着的页面
+            if env.page.is_closed():  # 检查当前页面是否已死
+                if len(env.context.pages) > 0:
+                    env.page = env.context.pages[0] # 切回第一个标签页
+                    env.page.bring_to_front()
+                    logger.info(f"Active page was closed, switched focus to tab 0: {env.page.url}")
+
             if not tools_is_local_url(env.page.url):
                 for i, page in enumerate(env.context.pages):
                     if tools_is_local_url(page.url):

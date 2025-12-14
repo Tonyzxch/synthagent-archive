@@ -534,3 +534,67 @@ Return **only** one JSON object (no extra text, no code fences):
     ]
 
     return message
+
+
+def prompt_fara_grounding_synthesis(
+    url: str,
+    element_html: str,
+    element_box: tuple[int, int, int, int] | None,
+    screenshot: "np.ndarray"
+) -> list[dict]:
+    
+    # 模式 A: 针对具体元素的 Grounding 任务 (Click/Type)
+    if element_box:
+        prompt = f"""You are an expert in Web UI Grounding. 
+Generate a training sample based on the UI element highlighted in the RED BOX.
+
+**Input Context**
+- Page URL: {url}
+- Element HTML: `{element_html}`
+
+**Task Requirements**
+1. **User Query**: A natural language command that would require interacting with this element.
+2. **Thought**: A reasoning step explaining why this element matches the query (describe the element's visual feature or function).
+3. **Action**: The action is pre-determined as interacting with the red box.
+
+**Examples from Fara**
+- Query: "I’d like to increase the quantity by one"
+  Thought: "I’ll click the plus icon to add one more to the item quantity"
+- Query: "Go to the XL size option"
+  Thought: "I’ll click on XL to choose the extra large size"
+
+**Output JSON Format (No markdown, just JSON)**
+{{
+  "Query": "...",
+  "Thought": "..."
+}}
+"""
+        redbox_screenshot = tools_draw_red_bbox(screenshot, element_box)
+        images = [redbox_screenshot]
+
+    # 模式 B: 针对全页面的 VQA/Caption 任务 (Action: stop)
+    else:
+        prompt = f"""You are an expert in Web UI Understanding.
+Generate a "Page Description" training sample for this screenshot.
+
+**Task Requirements**
+1. **User Query**: A question asking about the visual content (e.g., "What can you see in this interface?", "Describe this page.").
+2. **Thought**: A detailed visual description of the page layout, key sections, and purpose.
+3. **Action**: The action is "stop" (because it's a pure visual question).
+
+**Output JSON Format**
+{{
+  "Query": "What can you see in this interface screenshot?",
+  "Thought": "This is a screenshot of [Website Name]..."
+}}
+"""
+        images = [screenshot]
+
+    content = [{"type": "text", "text": prompt}]
+    for img in images:
+        content.append({
+            "type": "image_url", 
+            "image_url": {"url": tools_ndarray_to_base64_image(img)}
+        })
+
+    return [{"role": "user", "content": content}]

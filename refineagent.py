@@ -272,7 +272,14 @@ class ExeAgent(Explorer):
                 self.config.target_env = task_dict['sites'][0]
                 self.config.post_process()
 
-            env_target_port = os.environ[f"{self.config.target_env.upper()}_PORT"]
+            # 增加对 custom 环境的兼容
+            if self.config.target_env == 'custom':
+                # custom 环境通常是外部 URL，不需要端口替换，随便给一个值即可
+                env_target_port = str(self.config.env.env_start_port)
+            else:
+                # 只有 webarena 内置环境才需要查特定的 PORT 变量
+                env_target_port = os.environ[f"{self.config.target_env.upper()}_PORT"]
+
             task_dict = replace_with_env(task_dict, env_target_port)
 
             task = task_dict['task']

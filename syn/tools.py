@@ -216,6 +216,11 @@ def tools_draw_red_bbox(
     t_box = max(1, int(round(max(w, h) * 0.03)))
     thickness = min(t_img, t_box)
 
+    if screenshot.shape[2] == 3:
+        import numpy as np
+        # 如果是3通道，手动补一个全不透明的Alpha通道(255)，变成4通道
+        screenshot = np.dstack((screenshot, np.full(screenshot.shape[:2], 255, dtype=screenshot.dtype)))
+    
     bgra = screenshot[..., [2, 1, 0, 3]].copy()
 
     pt1 = (int(x), int(y))

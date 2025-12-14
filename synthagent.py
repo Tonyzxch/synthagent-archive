@@ -404,34 +404,3 @@ if __name__ == "__main__":
     synthagent = SynthAgent(args)
     synthagent.run_episode(args.target_start_url)
     logger.info(f"synthagent done! started at {start_time} Elapsed time: {tools_elapsed_time_print(start_time)}\n{args}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-     
