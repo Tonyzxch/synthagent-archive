@@ -205,54 +205,127 @@ class SynthAgent(Explorer):
         selected = np.random.choice(tasks, size=num_samples, replace=False, p=task_weights)
 
         return list(selected)
-                
+
+    # 辅助函数：把 bounding box 转成中心点坐标
+    def _get_center_coords(self, bbox):
+        if not bbox: return 0, 0
+        x, y, w, h = bbox
+        return int(x + w / 2), int(y + h / 2)
+
     @stat_time
     def batch_generate_high_level_task(self, before_state: list[StateInfo], action: list[Action], new_state: list[StateInfo]) -> list[list[str|None, str|None]]:
-        """Prompts the LLM to generate a high-level task and low-level instruction based on a state transition."""
-        
-        batch_message = [
-            prompt_osgenesis_generate_high_level_task(
-                website_intro=self.config.target_env_description,
-                curr_state_screenshot=before_state.raw_state.screenshot,
-                new_state_screenshot=new_state.raw_state.screenshot,
-                current_action_str=str(action),
-                bounding_box=action.target_element.union_bound if action.target_element else None,
-                website_name=self.config.target_env,
-            )
-            for before_state, action, new_state in zip(before_state, action, new_state)
-        ]
+        """
+        Modified to use Fara-7B Grounding Logic:
+        Generate 'Query' + 'Thought' + 'Action(x,y)' data samples.
+        """
+        from syn.prompts import prompt_fara_grounding_synthesis 
 
-        batch_message: list[dict] = [
+        batch_message = []
+        # 保存原始动作和bbox，用于后续计算坐标和判断类型
+        metadata_list = [] 
+
+        for state, act in zip(before_state, action):
+            bbox = None
+            html_snip = ""
+            
+            # 判断是否为 VQA 任务 (ActionType.STOP 是我们在 run_episode 里手动插入的标记)
+            is_vqa = (act.action_type == ActionType.STOP)
+
+            if not is_vqa and act.target_element:
+                bbox = act.target_element.union_bound
+                html_snip = act.target_element.accessibility_tree_content
+            elif not is_vqa:
+                # 是一些没有元素的动作（如滚动），暂时设为空
+                html_snip = "Page Interaction"
+
+            # 调用 Prompt 生成函数
+            msg = prompt_fara_grounding_synthesis(
+                url=state.raw_state.url,
+                element_html=html_snip,
+                element_box=bbox, # 如果是 VQA，这里是 None，Prompt 会走 VQA 分支
+                screenshot=state.raw_state.screenshot
+            )
+            batch_message.append(msg)
+            metadata_list.append((act, bbox))
+
+        # 构造请求配置
+        batch_request_configs: list[dict] = [
             {'messages': msg, **self.config.gpt.__dict__}
             for msg in batch_message
         ]
 
         tasks = [[None, None] for _ in range(len(batch_message))]
 
-        for idx, req in enumerate(batch_message):
-            response = self.gpt_client.request(
-                req["messages"],
-                json_mode=True,
-                **self.config.gpt.__dict__ | {'max_completion_tokens': 1024},
-            )
+        # 解析结果并格式化为 Fara 样式
+        results = []
+        for idx, (req, (original_act, original_bbox)) in enumerate(zip(batch_request_configs, metadata_list)):
             try:
+                response = self.gpt_client.request(
+                    req["messages"],
+                    json_mode=True,
+                    **self.config.gpt.__dict__ | {'max_completion_tokens': 1024},
+                )
                 response_text = response.message.content
                 data = json.loads(response_text)
 
-                if isinstance(data, dict) and 'High-Level-Instruction' in data:
-                    tasks[idx][0] = data['High-Level-Instruction']
+                # 根据 ActionType 生成对应的 Fara 动作格式
+                cx, cy = self._get_center_coords(original_bbox)
+                
+                # 1. 点击 (Left click)
+                if original_act.action_type == ActionType.CLICK:
+                    fara_action_str = f"Action: click({cx}, {cy})"
+                
+                # 2. 输入 (Type) - Fara 定义: Enter an input string at coordinate (x, y)
+                elif original_act.action_type == ActionType.TYPE:
+                    # 获取输入内容，处理一下引号防止格式乱掉
+                    text_content = original_act.value.replace("'", "").replace('"', "")
+                    fara_action_str = f"Action: type({cx}, {cy}, '{text_content}')"
+                
+                # 3. 悬停 (Move mouse)
+                elif original_act.action_type == ActionType.HOVER:
+                    fara_action_str = f"Action: hover({cx}, {cy})"
+                
+                # 4. 滚动 (Scroll)
+                elif original_act.action_type == ActionType.SCROLL:
+                    # SynthAgent 的 scroll value 通常是 'up' 或 'down'
+                    # Fara Table 7 描述较笼统，我们可以定义为 scroll(direction)
+                    fara_action_str = f"Action: scroll('{original_act.value}')"
+                
+                # 5. 页面跳转 (Visit url / GOTO)
+                elif original_act.action_type == ActionType.GOTO:
+                    fara_action_str = f"Action: visit_url('{original_act.value}')"
+                
+                # 6. 后退 (History back)
+                elif original_act.action_type == ActionType.GO_BACK:
+                    fara_action_str = "Action: history_back()"
+                
+                # 7. VQA / 停止 (Terminate / Stop)
+                elif original_act.action_type == ActionType.STOP:
+                    fara_action_str = "Action: stop"
+                
+                # 兜底：如果是其他动作但有坐标，默认回退到 click，否则 stop
                 else:
-                    logger.warning(f"cannot parse high-level instruction from {data}")
+                    if original_bbox:
+                        fara_action_str = f"Action: click({cx}, {cy})"
+                    else:
+                        fara_action_str = "Action: stop"
 
-                if isinstance(data, dict) and 'Sub-Instruction' in data:
-                    tasks[idx][1] = data['Sub-Instruction']
+                if isinstance(data, dict) and 'Query' in data and 'Thought' in data:
+                    fara_query = data['Query']
+                    fara_thought = data['Thought']
+                    
+                    # 拼装 Fara 完整样本
+                    full_sample_text = f"{fara_query}\nThought: {fara_thought}\n{fara_action_str}"
+                    
+                    tasks[idx][0] = fara_query
+                    tasks[idx][1] = full_sample_text
+                    
+                    logger.info(f"[Fara-Style] Generated Sample:\n{full_sample_text}")
                 else:
-                    logger.warning(f"cannot parse sub-instruction from {data}")
-
-                logger.info(f"Generated high-level task and low-level instruction: {tasks[idx]}")
+                    logger.warning(f"cannot parse Fara fields (Query/Thought) from {data}")
 
             except Exception as e:
-                logger.error(f"Error generating high-level task: {e}")
+                logger.error(f"Error processing task {idx}: {e}")
 
         return tasks
 
@@ -322,6 +395,31 @@ class SynthAgent(Explorer):
             # find new elements
             current_state_elements = set(current_state.elements)
             new_elements = current_state_elements - prev_state_elements
+
+            if current_state.raw_state.url not in self.url_visit_count or self.url_visit_count[current_state.raw_state.url] <= 2:
+                # 1. 造一个假的 Action
+                vqa_action = Action(element=None, action_type=ActionType.STOP, value="VQA Task")
+                
+                # 2. 创建 Trajectory 对象
+                exp_traj = ExplorationTraj(curr_state=current_state)
+                
+                # 手动初始化内部结构，防止 IndexError
+                # (1) 先添加一个占位的 HighLevelTask
+                exp_traj.add_high_level_task("pending_vqa_generation", current_state)
+                
+                # (2) 再构造一个 LowLevelTask 结构并添加进去
+                vqa_task_struct = LowLevelTask(
+                    task="pending_vqa_generation",  # 稍后会被 LLM 生成的内容覆盖
+                    curr_state=current_state,
+                    action=vqa_action,
+                    state_after=current_state,      # VQA 任务不改变页面状态
+                    task_status=LowTaskStatus.END   # 标记为已完成
+                )
+                exp_traj.add_low_level_task(vqa_task_struct)
+
+                # 3. 放入 buffer
+                self.exp_traj_buffer.append((current_state, vqa_action, exp_traj))
+                logger.info("Added a VQA task for the new page.")
 
             category2tasks = self.categorize_tasks_for_action(current_state, excluding_elements=self.unclick_elem_pool)
             selected_tasks: list[LowLevelTask] = self._weighted_select_element_by_category(current_state.raw_state.url, category2tasks, new_elements)
