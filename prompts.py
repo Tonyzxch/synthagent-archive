@@ -1,6 +1,6 @@
 from syn.tools import tools_ndarray_to_base64_image
 
-# 1. 通用导航 Prompt：基于信息密度判断点击目标
+# 1. 选择目标 Prompt
 def prompt_select_deep_link(
     url: str, 
     elements_text: str, 
@@ -88,7 +88,7 @@ Return JSON ONLY: {{"element_id": <int_id>}}
     return [{"role": "user", "content": content}]
 
 
-# 2. 任务进化 Prompt：基于动作的意图演化
+# 2. 任务进化 Prompt
 def prompt_evolve_task_description(
     url: str,
     prev_task: str,
@@ -131,7 +131,7 @@ Return JSON ONLY: {{ "updated_task": "The natural language user intent string...
     return [{"role": "user", "content": content}]
 
 
-# 3. 逆向工程 Prompt：自动识别领域并生成任务
+# 3. 逆向工程 Prompt
 def prompt_reverse_engineer_task(
     url: str, 
     screenshot: "np.ndarray", 
@@ -142,29 +142,23 @@ def prompt_reverse_engineer_task(
     else:
         history_str = " -> ".join(history_summary)
     
-    prompt = f"""You are an Expert Task Generator.
+    prompt = f"""You are an Expert Task Generator for a Web Agent Benchmark.
 The user has navigated through: {history_str}
-And is currently looking at the page shown in the screenshot.
 Current URL: {url}
 
 **Goal**
-1. **Detect Domain**: Analyze the screenshot to identify the website type (Real Estate, Recruitment, E-commerce, Gov, Travel, etc.).
-2. **Reverse Engineer**: Generate a **Complex, Specific, Multi-constraint User Instruction** that fits this domain.
+Generate a **High-Level User Intent** based on the navigation history and the final page context.
+The "Less is More" Rule: Real users are lazy. They usually have **1 major constraint** or **1-2 specific feature requirements**, NEVER list too many specs at once.
+CRITICAL: The task must be **challenging but solvable**. Avoid "Over-Specification" (describing the specific entity in the screenshot too precisely).
 
-**Strict Output Template**
-
-❌ BAD (Too Generic):
-"Find a house." / "Find a job." / "Read news."
-
-✅ GOOD (Specific & Complex):
-For example:
-- (If Real Estate): "I am looking for a **3-bedroom apartment** in **[Location]** with a budget of **[Price]**. Ensure it is **south-facing**."
-- (If Recruitment): "Search for a **[Job Title]** position in **[City]**. The company should be **[Company Name]** and offer a salary of **[Salary Range]**."
-- (If Gov/News): "Find the specific notice regarding **[Policy Name]** published on **[Date]**."
-
-**Requirements**
-1. **Extract Details**: Use the text visible in the screenshot (names, numbers, dates) to make the task realistic.
-2. **Evidence-Based Only**: Avoid Over-Specification. Do not add constraints that you cannot verify.
+**Universal Constraint Logic**
+1. **Hard Constraints (From History)**: 
+   - If the user clicked specific filters, tabs, or sort buttons (e.g., "Sort by Date", "Label: Bug", "Price: Low to High"), these conditions should be included in the task.
+   
+2. **Soft Constraints (From Screenshot - Generalization)**: 
+   - If you see a specific entity (e.g., a specific product, a specific post, a specific code issue). 
+   - Describe it by its **distinguishing features** (Less is More).
+   - **Do NOT** describe everything about its features. Avoid to be too specific.
 
 **Output Requirement**
 Return JSON ONLY: 

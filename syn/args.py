@@ -276,7 +276,7 @@ class ExeAgentConfig(ExploreConfig):
 
         self._set_output(subfolder='exeagent')
 
-        self.sleep_after_action = max(self.sleep_after_action, 2.0)
+        self.sleep_after_action = max(self.sleep_after_action, 1.0)
 
 
 if __name__ == "__main__":
