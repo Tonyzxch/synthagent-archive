@@ -1,6 +1,6 @@
 from syn.tools import tools_ndarray_to_base64_image
 
-# 1. 动作选择 Prompt
+# 1. 动作选择 Prompt (支持全动作空间)
 def prompt_select_deep_link(
     url: str, 
     elements_text: str, 
@@ -13,13 +13,13 @@ def prompt_select_deep_link(
     progress_ratio = current_depth / max(max_depth, 1)
     
     if progress_ratio < 0.3:
-        phase_instruction = "**Phase: DISCOVERY**\nGoal: Broad search or Category selection. Use `TYPE` (Search) or `CLICK` menus."
+        phase_instruction = "**Phase: EXPLORATION**\nGoal: Start exploration. \n- If looking for a specific item type, prefer using **TYPE** in the search bar.\n- If browsing, use `CLICK` on categories."
     elif progress_ratio < 0.7:
-        phase_instruction = "**Phase: NAVIGATION**\nGoal: Locate content. `SCROLL` to find items, `CLICK` filters, or `GO_BACK` if stuck."
+        phase_instruction = "**Phase: NAVIGATION**\nGoal: Locate and Enter content. Prioritize `CLICK` on visible items or filters. Use `SCROLL` ONLY if no relevant items are currently visible. Use `GO_BACK` if stuck."
     else:
-        phase_instruction = "**Phase: TARGETING**\nGoal: Interact with a specific Entity. `CLICK` the target. If task is done, `NONE`."
+        phase_instruction = "**Phase: TARGETING & VERIFICATION**\nGoal: Finalize the task. \n1. Interact with the target.\n2. **VERIFY THE RESULT**: Do NOT stop immediately after a click. Wait to confirm the action succeeded before using `NONE`."
 
-    history_str = " -> ".join(history_summary[-5:]) # 目前只保留最近5步操作，如果深度加深需注意这里
+    history_str = " -> ".join(history_summary[-5:]) 
 
     prompt = f"""You are an Autonomous Web Agent exploring a website.
 **Context**:
@@ -27,17 +27,25 @@ def prompt_select_deep_link(
 - History: {history_str}
 {phase_instruction}
 
-**Full Standard Action Space**:
-1. **CLICK**: Select a link/button. (Param: `element_id`)
-2. **TYPE**: Input text. (Param: `element_id`, `value`)
-3. **HOVER**: Mouse over an element. (Param: `element_id`)
+**Action Space**:
+1. **CLICK**: Select a link/button. 
+   - Param: `element_id`
+   - Note: Do NOT use CLICK for input fields, use TYPE instead.
+2. **TYPE**: Input text into a search bar or form.
+   - **CRITICAL RULE**: If the element tag is `<INPUT>` or `<TEXTAREA>`, you MUST use `TYPE`. Do NOT use `CLICK`.
+   - Param: `element_id`, `value` (the text to type)
+3. **HOVER**: Mouse over an element. 
+   - Param: `element_id`
+   - Use ONLY for dropdown menus or revealing hidden options.
 4. **SCROLL**: Move page. (Param: `direction`: 'up' or 'down')
 5. **PRESS**: Keyboard shortcut. (Param: `key_comb`: 'Enter', 'PageDown', 'Tab')
 6. **GO_BACK**: Return to previous page. (Param: None)
 7. **GO_FORWARD**: Go to next page (rare). (Param: None)
 8. **GOTO**: Direct URL navigation. (Param: `value` as url). *Use only if navigation is broken.*
 9. **STOP**: Give up. (Param: `value` as reason). *Use only if task is impossible.*
-10. **NONE**: Finish task. (Param: `value` as summary). *Use when goal is reached.*
+# 10. **NONE**: Finish task. (Param: `value` as summary). 
+#     - *Constraint*: Do NOT use NONE on a search result list or category page. 
+#     - *Requirement*: Use ONLY when you have reached a specific content page or cannot proceed further.
 
 **Interactive Elements**:
 {elements_text}

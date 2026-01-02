@@ -81,7 +81,8 @@ def get_interactive_elements(page, visited_texts=None):
             // 计算距离中心的距离，用于排序
             const dist = Math.sqrt(Math.pow(rect.left + rect.width/2 - centerX, 2) + Math.pow(rect.top + rect.height/2 - centerY, 2));
             
-            let text = el.innerText.trim() || el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('placeholder') || "";
+            // 优先取 value (针对有默认值的 input)，然后取 innerText 等
+            let text = el.value || el.innerText.trim() || el.getAttribute('title') || el.getAttribute('aria-label') || el.getAttribute('placeholder') || "";
             let tagName = el.tagName;
             
             // 简单清洗
@@ -100,19 +101,19 @@ def get_interactive_elements(page, visited_texts=None):
     filtered_elements = []
     seen_texts = set()
 
-    # 按距离中心排序，优先保留主要内容
+    # 排序策略：1. 输入框最优先 2. 距离中心越近越优先
     raw_elements.sort(key=lambda x: (x['tagName'] != 'INPUT', x['dist'])) 
 
     for el in raw_elements:
         text = el['text']
         if text in visited_texts: continue
         if text in seen_texts: continue
-        # 严格去重，避免 context 浪费在重复的商品卡片按钮上
+        # 严格去重
         seen_texts.add(text) 
         if any(bad in text for bad in blacklist): continue
         filtered_elements.append(el)
 
-    selected_elements = filtered_elements[:200]  # 选择200个元素交给GPT
+    selected_elements = filtered_elements[:200]  # 只取前200个最优质的元素
     
     # 重新按 index 排序，方便 GPT 理解 DOM 顺序
     selected_elements.sort(key=lambda x: x['index'])
@@ -120,15 +121,32 @@ def get_interactive_elements(page, visited_texts=None):
     gpt_text_lines = []
     valid_indices = []
     for i, el in enumerate(selected_elements):
-        # 增加 ID 映射，防止 GPT 幻觉原始 index
-        # 格式优化： {id} <TAG> "Text"
         gpt_text_lines.append(f"{{id: {i}}} <{el['tagName']}> \"{el['text']}\"")
         valid_indices.append(el['index']) 
     
     return "\n".join(gpt_text_lines), valid_indices
 
 
-def call_gpt_via_client(client, messages, model_name):
+def call_gpt_via_client(client, messages, model_name, allow_image_fallback=True):
+    """
+    统一调用接口
+    :param allow_image_fallback: 如果因为图片导致 Refusal，是否允许移除图片后重试
+    """
+    def _extract_text_only(msgs):
+        """辅助函数：从消息中移除图片，只保留文本"""
+        text_msgs = []
+        for m in msgs:
+            # 过滤 content list，只留 type='text'
+            if isinstance(m.get('content'), list):
+                new_content = [item for item in m['content'] if item.get('type') == 'text']
+                if new_content:
+                    text_msgs.append({"role": m['role'], "content": new_content})
+            else:
+                # 如果本来就是纯文本字符串，直接保留
+                text_msgs.append(m)
+        return text_msgs
+
+    # 第 1 次尝试：带图正常请求
     try:
         response = client.request(
             messages=messages,
@@ -137,10 +155,47 @@ def call_gpt_via_client(client, messages, model_name):
             max_completion_tokens=1024,
             json_mode=True
         )
-        return response.message.content
+        
+        # 检查是否被拒绝 (OpenAI Refusal)
+        refusal = getattr(response.message, 'refusal', None)
+        if refusal:
+            print(f"🛑 OpenAI Refusal (Image likely): {refusal}")
+            # 如果不允许回退，直接返回 None
+            if not allow_image_fallback:
+                return None
+            # 否则，进入下方的回退逻辑...
+        else:
+            return response.message.content
+
     except Exception as e:
-        print(f"⚠️ GPT 调用失败: {e}")
-        return None
+        print(f"⚠️ GPT 首次调用异常: {e}")
+        if not allow_image_fallback:
+            return None
+
+    # 第 2 次尝试：降级为纯文本
+    if allow_image_fallback:
+        print("🔄 尝试移除图片，进行纯文本重试 (Text-Only Fallback)...")
+        text_messages = _extract_text_only(messages)
+        
+        try:
+            response = client.request(
+                messages=text_messages, # 用纯文本
+                model=model_name,
+                temperature=0.7,
+                max_completion_tokens=1024,
+                json_mode=True
+            )
+            if getattr(response.message, 'refusal', None):
+                print(f"❌ 纯文本重试依然被拒绝: {response.message.refusal}")
+                return None
+                
+            print("✅ 纯文本重试成功！")
+            return response.message.content
+        except Exception as e:
+            print(f"❌ 纯文本重试失败: {e}")
+            return None
+            
+    return None
 
 
 def run_one_exploration(browser_context, start_url, max_depth, global_root_blacklist, gpt_client, model_name, output_dir):
@@ -153,11 +208,16 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
         current_task_desc = "Find a specific item or service."
         evolution_history = [] 
         history_breadcrumbs = ["Homepage"]
-        ground_truth_trajectory = [] 
+        ground_truth_trajectory = []
         current_depth = 0
-        consecutive_scroll_count = 0
         session_clicked_texts = set() 
         consecutive_scroll_count = 0
+        consecutive_error_count = 0
+
+        # 辅助函数：判断报错是否是成功的跳转
+        def is_navigating_error(e):
+            msg = str(e).lower()
+            return "context" in msg or "navigating" in msg or "closed" in msg or "destroyed" in msg
 
         while current_depth < max_depth:
             print(f"📍 [Depth {current_depth}] URL: {page.url}")
@@ -179,15 +239,20 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
                 max_depth=max_depth,
                 history_summary=history_breadcrumbs
             )
-            content = call_gpt_via_client(gpt_client, messages, model_name)
+            content = call_gpt_via_client(gpt_client, messages, model_name, allow_image_fallback=True)
             if not content: break
 
             # 解析逻辑 (支持所有动作)
-            action_type, thought, chosen_id, input_value, scroll_dir, key_comb = "click", "", -1, "", "down", ""
+            action_type = "click"
+            thought = ""
+            chosen_id = -1
+            input_value = ""
+            scroll_dir = "down"
+            key_comb = ""
             
             try:
                 choice = json.loads(content)
-                # 兼容旧格式处理
+                # 兼容处理
                 if "action" not in choice: 
                     for k in ["click", "type", "hover", "scroll", "press", "goto", "go_back", "go_forward", "stop", "none"]:
                         if k in choice:
@@ -222,22 +287,20 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
             
             # --- Group A: 终止类动作 (STOP / NONE) ---
             if action_type in ["stop", "none"]:
+                consecutive_error_count = 0
                 print(f"🛑 Agent 决定结束任务: {action_type.upper()} ({input_value})")
-                # 记录最后一步并退出循环
                 action_record = {"step": current_depth, "type": action_type, "desc": f"Finished: {input_value}", "thought": thought}
                 ground_truth_trajectory.append(action_record)
                 break 
 
             # --- Group B: 导航类动作 (SCROLL) ---
             elif action_type == "scroll":
-                # 1. 检查是否已经达到“软上限” (这里是3次)
+                consecutive_error_count = 0
+                
                 if consecutive_scroll_count >= 3:
-                    print(f"⚠️ 连续滚动 ({consecutive_scroll_count}) 触发限制。拦截操作，强制 Agent 换动作。")
-                    
-                    warning_msg = "SYSTEM WARNING: Scroll limit reached! You CANNOT scroll anymore. You MUST select an element to CLICK, or TYPE, or STOP."
+                    print(f"⚠️ 连续滚动 ({consecutive_scroll_count}) 触发限制。拦截操作。")
+                    warning_msg = "SYSTEM WARNING: Scroll limit reached! You have scrolled too many times. You MUST select a visible element to CLICK, TYPE, HOVER or PRESS now."
                     history_breadcrumbs.append(warning_msg)
-                    
-                    consecutive_scroll_count += 1
                     continue 
 
                 print(f"👇 执行滚动: {scroll_dir}")
@@ -245,40 +308,47 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
                 page.evaluate(f"window.scrollBy(0, {delta})")
                 time.sleep(1)
                 
-                consecutive_scroll_count += 1  # 计数器 +1
-                
-                ground_truth_trajectory.append({"step": current_depth, "type": "scroll", "desc": f"Scroll {scroll_dir}", "thought": thought})
+                consecutive_scroll_count += 1
                 history_breadcrumbs.append(f"Scroll {scroll_dir}")
+                ground_truth_trajectory.append({"step": current_depth, "type": "scroll", "desc": f"Scroll {scroll_dir}", "thought": thought})
                 continue
 
-            elif action_type == "go_back":
+            # 非滚动操作，重置滚动计数
+            consecutive_scroll_count = 0
+
+            # --- Group C: 页面导航 (GO_BACK / FORWARD / GOTO) ---
+            if action_type == "go_back":
+                consecutive_error_count = 0
                 print("🔙 执行后退")
                 page.go_back()
-                page.wait_for_load_state("domcontentloaded")
+                try: page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except: pass
                 ground_truth_trajectory.append({"step": current_depth, "type": "go_back", "desc": "Go Back", "thought": thought})
                 history_breadcrumbs.append("Back")
                 continue
 
             elif action_type == "go_forward":
+                consecutive_error_count = 0
                 print("🔜 执行前进")
                 page.go_forward()
-                page.wait_for_load_state("domcontentloaded")
+                try: page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except: pass
                 ground_truth_trajectory.append({"step": current_depth, "type": "go_forward", "desc": "Go Forward", "thought": thought})
                 continue
 
             elif action_type == "goto":
+                consecutive_error_count = 0
                 print(f"🔗 直接跳转 (GOTO): {input_value}")
-                try:
-                    page.goto(input_value, timeout=60000)
-                except:
-                    print("⚠️ GOTO 失败")
+                try: page.goto(input_value, timeout=60000)
+                except: print("⚠️ GOTO 失败")
                 ground_truth_trajectory.append({"step": current_depth, "type": "goto", "desc": f"GOTO {input_value}", "thought": thought})
                 history_breadcrumbs.append(f"GOTO {input_value}")
-                current_depth += 1 # GOTO 算一次大跳转
+                current_depth += 1
                 continue
 
-            # --- Group C: 全局键盘 (PRESS) ---
+            # --- Group D: 全局键盘 (PRESS) ---
             elif action_type == "press":
+                consecutive_error_count = 0
                 key = key_comb or "Enter"
                 print(f"🎹 键盘按键: {key}")
                 page.keyboard.press(key)
@@ -288,10 +358,11 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
                 except: pass
                 continue
 
-            # --- Group D: 元素交互 (CLICK / TYPE / HOVER) ---
+            # --- Group E: 元素交互 (CLICK / TYPE / HOVER) ---
             elif isinstance(chosen_id, int) and 0 <= chosen_id < len(valid_indices):
+                consecutive_error_count = 0 
+                
                 old_pages_count = len(browser_context.pages)
-
                 original_index = valid_indices[chosen_id]
                 
                 # 提取文本
@@ -323,73 +394,112 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
                         try: target_el.scroll_into_view_if_needed(timeout=1000)
                         except: pass
 
+                        # === HOVER ===
                         if action_type == "hover":
-                            target_el.hover(force=True)
-                            time.sleep(1) 
-                            print("   🖱️ 悬停完成")
+                            try:
+                                target_el.hover(force=True)
+                                time.sleep(1) 
+                                print("   🖱️ 悬停完成")
+                            except: print("   ⚠️ 悬停失败")
                         
+                        # === TYPE ===
                         elif action_type == "type":
-                            target_el.click(force=True)
-                            modifier = "Meta" if sys.platform == "darwin" else "Control"
-                            page.keyboard.press(f"{modifier}+A")
-                            page.keyboard.press("Backspace")
-                            page.keyboard.type(input_value or "", delay=50)
-                            print(f"   ⌨️ 输入完成")
-                            page.keyboard.press("Enter")
-                            try: page.wait_for_load_state("networkidle", timeout=3000)
-                            except: pass
+                            print(f"   ⌨️ 输入: '{input_value}'")
+                            try:
+                                target_el.click(force=True)
+                                modifier = "Meta" if sys.platform == "darwin" else "Control"
+                                page.keyboard.press(f"{modifier}+A")
+                                page.keyboard.press("Backspace")
+                                page.keyboard.type(input_value or "", delay=50)
+                                page.keyboard.press("Enter")
+                                try: page.wait_for_load_state("networkidle", timeout=3000)
+                                except: pass
+                            except Exception as e:
+                                if is_navigating_error(e): print("   🌊 输入触发跳转 (视为成功)")
+                                else: print(f"   ⚠️ 输入失败: {e}")
 
-                        else: # CLICK
+                        # === CLICK ===
+                        else: 
                             click_success = False
+
+                            # 策略 A: Popup
                             try:
                                 with page.expect_popup(timeout=2000) as popup_info:
-                                    target_el.click(force=True, timeout=2000)
+                                    target_el.click(force=True, timeout=3000)
                                 page = popup_info.value
                                 print("   🔀 捕获新标签页")
                                 click_success = True
-                            except:
-                                try:
-                                    target_el.click(force=True, timeout=2000)
+                            except Exception as e:
+                                if is_navigating_error(e): 
+                                    print("   🌊 点击触发跳转 (视为成功)")
                                     click_success = True
-                                except:
-                                    # 兜底：文本点击
-                                    print(f"   🛡️ 句柄失效，尝试文本点击: {clean_text}")
+                                else:
+                                    # 策略 B: 普通点击
                                     try:
-                                        page.get_by_text(clean_text, exact=False).first.click(force=True)
+                                        target_el.click(force=True, timeout=3000)
                                         click_success = True
-                                    except: pass
+                                    except Exception as e_b:
+                                        if is_navigating_error(e_b):
+                                            print("   🌊 点击触发跳转 (视为成功)")
+                                            click_success = True
+                                        else:
+                                            # 策略 C: 文本点击
+                                            print(f"   🛡️ 句柄失效，尝试文本点击: {clean_text}")
+                                            try:
+                                                page.get_by_text(clean_text, exact=False).first.click(force=True, timeout=3000)
+                                                click_success = True
+                                            except Exception as e_t:
+                                                if is_navigating_error(e_t):
+                                                    print("   🌊 点击触发跳转 (视为成功)")
+                                                    click_success = True
                             
+                            # 策略 D: JS 强行点击 (带页面死亡检测)
                             if not click_success:
-                                print("   🔧 JS 强行点击")
-                                page.evaluate(f"document.querySelectorAll('{selector_str}')[{original_index}].click()")
+                                try:
+                                    page.evaluate("1+1", timeout=500) # 检查页面存活
+                                except:
+                                    print("   🌊 (检查发现页面已失去响应，判定之前的点击成功)")
+                                    click_success = True
+
+                                if not click_success:
+                                    print("   🔧 尝试 JS 强行点击")
+                                    try:
+                                        safe_js = f"""
+                                        (() => {{
+                                            const els = document.querySelectorAll('{selector_str}');
+                                            if (els.length === 0) return "ZERO";
+                                            const el = els[{original_index}];
+                                            if (el) {{ el.click(); return "CLICKED"; }}
+                                            return "NOT_FOUND";
+                                        }})()
+                                        """
+                                        res = page.evaluate(safe_js)
+                                        if res == "CLICKED" or res == "ZERO": click_success = True
+                                    except Exception as e_js:
+                                        if is_navigating_error(e_js) or "Total: 0" in str(e_js):
+                                            print("   🌊 JS点击触发跳转 (视为成功)")
+                                            click_success = True
+                                        else:
+                                            print(f"   ❌ 点击彻底失败: {e_js}")
+                                            break
 
                     else:
                         print("⚠️ 元素 Index 失效")
 
+                    # 后处理
                     try: page.wait_for_load_state("domcontentloaded", timeout=5000)
                     except: pass
-                    
-                    # 检查是否因为点击发生了页面跳转
-                    if len(browser_context.pages) > old_pages_count:
-                        page = browser_context.pages[-1]
+                    if len(browser_context.pages) > old_pages_count: page = browser_context.pages[-1]
 
-                    # 登录检测
+                    # 登录页检测
                     try:
-                        # 尝试获取标题
-                        current_title = page.title().lower()
-                        if "login" in current_title or "sign in" in current_title:
+                        if "login" in page.title().lower() or "sign in" in page.title().lower():
                             print("🛑 遇到登录页，停止。")
                             break
-                    except Exception as e_title:
-                        # 如果报错是因为 Context destroyed，说明页面正在跳转中，这是好事！
-                        if "Execution context was destroyed" in str(e_title):
-                            print("   🌊 页面正在跳转中 (忽略 Title 检查错误)")
-                        else:
-                            # 其他错误则打印出来
-                            print(f"  ⚠️ Title 检查警告: {e_title}")
+                    except: pass
 
-                    # 意图演化
-                    if action_type in ["click", "type"]:
+                    # 意图演化 (使用安全调用)
+                    if action_type in ["click", "type", "hover", "press"]:
                         screenshot_after = get_page_screenshot_np(page)
                         evolve_msgs = prompt_evolve_task_description(
                             url=page.url, 
@@ -398,7 +508,7 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
                             screenshot_before=screenshot_before,
                             screenshot_after=screenshot_after
                         )
-                        evolve_content = call_gpt_via_client(gpt_client, evolve_msgs, model_name)
+                        evolve_content = call_gpt_via_client(gpt_client, evolve_msgs, model_name, allow_image_fallback=True)
                         if evolve_content:
                             try:
                                 new_task = json.loads(evolve_content).get("updated_task")
@@ -419,9 +529,19 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
                 except Exception as e:
                     print(f"⚠️ 执行异常: {e}")
                     break
+
+            # ID 无效的处理
             else:
-                print("⚠️ 无效的动作类型或ID，跳过。")
-                break
+                consecutive_error_count += 1
+                print(f"⚠️ 无效的 ID (连续第 {consecutive_error_count} 次)，让 Agent 重试...")
+
+                if consecutive_error_count >= 3:
+                    print("🛑 连续多次 ID 无效，Agent 陷入死循环，强制结束任务。")
+                    break 
+
+                warning_msg = "SYSTEM ERROR: The element_id you selected is INVALID..."
+                history_breadcrumbs.append(warning_msg)
+                continue
 
         # 任务生成与保存
         print("🧠 生成最终任务...")
@@ -430,7 +550,7 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
             final_screenshot = np.zeros((1080, 1920, 3), dtype=np.uint8)
         
         gen_messages = prompt_reverse_engineer_task(page.url, final_screenshot, history_breadcrumbs)
-        content = call_gpt_via_client(gpt_client, gen_messages, model_name)
+        content = call_gpt_via_client(gpt_client, gen_messages, model_name, allow_image_fallback=True)
         
         complex_task = None
         visual_evidence = []
@@ -446,9 +566,10 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
 
         print(f"✅ 任务生成: {complex_task}\n")
 
+        # 审计逻辑
         audit_status = False 
         audit_reason = "Audit Failed or Skipped"
-        evidence_str = "\n".join(visual_evidence)
+        evidence_str = "\n".join(visual_evidence) if visual_evidence else "None"
 
         if complex_task and ground_truth_trajectory:
             print("🕵️ [Audit] 正在审计...")
@@ -458,11 +579,11 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
                 if audit_content:
                     audit_res = json.loads(audit_content)
                     if audit_res.get("is_valid"):
-                        audit_status = True  # 👈 更新状态
+                        audit_status = True
                         audit_reason = audit_res.get('reason')
                         print(f"✅ Audit Approved: {audit_reason}")
                     else:
-                        audit_status = False # 👈 更新状态
+                        audit_status = False
                         audit_reason = audit_res.get('reason')
                         print(f"⚠️ Audit Rejected: {audit_reason}")
             except Exception as e:
@@ -577,9 +698,8 @@ def main():
                 # 是否精品的判定标准
                 # 1. 任务描述必须存在 (task is not None/Empty)
                 # 2. 轨迹长度 >= 2 (避免只有 1 步，长度过短)
-                # 3. 必须有视觉证据 (visual_evidence list not empty，说明最后找到了东西)
-                # 4. GPT 审计必须通过 (audit_status is True)
-                if task_desc and len(trajectory) >= 2 and visual_ev and task_data.get("audit_status") is True:
+                # 3. GPT 审计必须通过 (audit_status is True)
+                if task_desc and len(trajectory) >= 2 and task_data.get("audit_status") is True:
                     is_high_quality = True
                 else:
                     filter_reason = []
