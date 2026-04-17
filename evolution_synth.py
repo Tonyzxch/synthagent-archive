@@ -546,23 +546,26 @@ def run_one_exploration(browser_context, start_url, max_depth, global_root_black
         # 任务生成与保存
         print("🧠 生成最终任务...")
         final_screenshot = get_page_screenshot_np(page)
-        if final_screenshot is None:
-            final_screenshot = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        if final_screenshot is None: final_screenshot = np.zeros((1080, 1920, 3), dtype=np.uint8)
         
-        gen_messages = prompt_reverse_engineer_task(page.url, final_screenshot, history_breadcrumbs)
-        content = call_gpt_via_client(gpt_client, gen_messages, model_name, allow_image_fallback=True)
+        gen_msgs = prompt_reverse_engineer_task(page.url, final_screenshot, history_breadcrumbs)
+        content = call_gpt_via_client(gpt_client, gen_msgs, model_name, allow_image_fallback=True)
         
-        complex_task = None
-        visual_evidence = []
+        complex_task, visual_evidence, tips = None, [], "" # 初始化 tips
+        
         if content:
             try:
                 res = json.loads(content)
                 complex_task = res.get("complex_task")
                 visual_evidence = res.get("visual_evidence", [])
+                tips = res.get("tips", "") # 获取 Tips
             except: pass
         
-        if not complex_task:
-            complex_task = current_task_desc
+        if not complex_task: complex_task = current_task_desc
+
+        # 如果有 tips，把它拼接到任务描述后面
+        if tips:
+            complex_task = f"{complex_task}\n{tips}"
 
         print(f"✅ 任务生成: {complex_task}\n")
 

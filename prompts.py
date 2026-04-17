@@ -1,6 +1,6 @@
 from syn.tools import tools_ndarray_to_base64_image
 
-# 1. 动作选择 Prompt (支持全动作空间)
+# 1. 动作选择 Prompt
 def prompt_select_deep_link(
     url: str, 
     elements_text: str, 
@@ -13,11 +13,11 @@ def prompt_select_deep_link(
     progress_ratio = current_depth / max(max_depth, 1)
     
     if progress_ratio < 0.3:
-        phase_instruction = "**Phase: EXPLORATION**\nGoal: Start exploration. \n- If looking for a specific item type, prefer using **TYPE** in the search bar.\n- If browsing, use `CLICK` on categories."
+        phase_instruction = "**Phase: EXPLORATION**\nGoal: Start exploration. Use `TYPE` for specific searches or `CLICK` on broad categories/menus."
     elif progress_ratio < 0.7:
-        phase_instruction = "**Phase: NAVIGATION**\nGoal: Locate and Enter content. Prioritize `CLICK` on visible items or filters. Use `SCROLL` ONLY if no relevant items are currently visible. Use `GO_BACK` if stuck."
+        phase_instruction = "**Phase: NAVIGATION & FILTERING**\nGoal: Locate specific content. \n- Prioritize `CLICK` on Filters, Sorting options, or Sub-categories to narrow down results.\n- Use `SCROLL` to find items if not visible."
     else:
-        phase_instruction = "**Phase: TARGETING & VERIFICATION**\nGoal: Finalize the task. \n1. Interact with the target.\n2. **VERIFY THE RESULT**: Do NOT stop immediately after a click. Wait to confirm the action succeeded before using `NONE`."
+        phase_instruction = "**Phase: TARGETING & VERIFICATION**\nGoal: Interact with the final target.\n- **VERIFY**: Do NOT stop immediately after a click. Wait/Scroll to confirm the action succeeded (e.g., success message, page update) before using `NONE`."
 
     history_str = " -> ".join(history_summary[-5:]) 
 
@@ -27,7 +27,7 @@ def prompt_select_deep_link(
 - History: {history_str}
 {phase_instruction}
 
-**Action Space**:
+**Full Standard Action Space**:
 1. **CLICK**: Select a link/button. 
    - Param: `element_id`
    - Note: Do NOT use CLICK for input fields, use TYPE instead.
@@ -43,9 +43,9 @@ def prompt_select_deep_link(
 7. **GO_FORWARD**: Go to next page (rare). (Param: None)
 8. **GOTO**: Direct URL navigation. (Param: `value` as url). *Use only if navigation is broken.*
 9. **STOP**: Give up. (Param: `value` as reason). *Use only if task is impossible.*
-# 10. **NONE**: Finish task. (Param: `value` as summary). 
-#     - *Constraint*: Do NOT use NONE on a search result list or category page. 
-#     - *Requirement*: Use ONLY when you have reached a specific content page or cannot proceed further.
+10. **NONE**: Finish task. (Param: `value` as summary). 
+    - **RESTRICTION**: Do NOT use `NONE` on a Search Results list, Category page, or Homepage.
+    - **REQUIREMENT**: You MUST be on a specific **Item Detail Page** or have completed a specific action (e.g., Submission, Download, Purchase).
 
 **Interactive Elements**:
 {elements_text}
@@ -75,7 +75,6 @@ def prompt_evolve_task_description(
     screenshot_after: "np.ndarray"
 ) -> list[dict]:
     
-    # 格式化动作描述
     act_type = action_record.get('action_type', 'unknown')
     if act_type == 'scroll':
         action_desc = f"Scrolled {action_record.get('element_text', 'down')} to explore"
@@ -100,8 +99,7 @@ Analyze the user's latest action to refine their High-Level Goal.
 **Refinement Logic**:
 1. **Search**: If they typed a query, the intent is now specific to that topic.
 2. **Navigation**: If they clicked a specific category, narrow the intent.
-3. **Exploration (Scroll)**: If they scrolled, they are "browsing" or "looking for more info". Keep the intent broad but imply thoroughness.
-4. **Correction (Back)**: If they went back, ignore the previous dead-end.
+3. **Exploration**: If they scrolled/hovered, they are looking for details.
 
 **Output Requirement**:
 Return JSON ONLY: {{ "updated_task": "Natural language intent string..." }}
@@ -125,30 +123,40 @@ def prompt_reverse_engineer_task(
     
     history_str = " -> ".join(history_summary)
     
-    prompt = f"""You are a Forensic Task Reconstructor.
-Generate a natural, high-level user instruction based on the behavior history.
+    prompt = f"""You are a Universal Web Task Architect.
+Your goal is to reverse-engineer a **Specific, Constraint-Based User Instruction** by analyzing the functional logic of the user's behavior.
 
-**User History**: {history_str}
-**Final Page Context**: (See Image)
+**Context**:
+- **User History**: {history_str}
+- **Final Page Context**: (See Image)
 
-**Synthesis Rules**:
+**Core Philosophy**:
+Trust your reasoning. Do not describe *what* the user clicked, but **WHY** they clicked it. Convert the "Mechanism" (Action) into a "Constraint" (Task Intent).
 
-1.  **INPUT HONESTY (Strict)**: 
-    - Check the history. Did the user use the `TYPE` action?
-    - If YES (e.g., Typed "games"), your task MUST start with "Search for 'games'...", do NOT hallucinate specific terms they didn't type.
+**Generation Rules (Strictly Follow)**:
 
-2.  **NOISE FILTERING (Important)**:
-    - Ignore mechanical steps like `Scroll down`, `Hover`, or `Go Back` in the final task description unless they are the *only* actions taken.
-    - Focus on the **Key Milestones** (Search -> Click Category -> Click Item).
+1.  **TASK GENERATION - "INTENT INFERENCE"**: 
+    - **Logic**: Translate the user's interactions into **specific semantic constraints** within the Task description.
+    - **Refinement Actions**: If the user selected a subset of items (via filters/menus), the Task MUST specify the **scope** (e.g., a specific timeframe, budget range, or attribute like color or size).
+    - **Prioritization Actions**: If the user reordered items (via sorting), the Task MUST specify an **Optimization Goal** (e.g., "find the cheapest", "find the latest", "find the most affordable", "find the most relevant", etc.).
+    - **Anti-Vagueness**: Never use phrases like "broad range" or "various options". If a user makes a selection, the task MUST be **specific**, not broad.
 
-3.  **TARGET GENERALIZATION**:
-    - **Do NOT** copy the exact full text of the final element (e.g., "Five Nights at Freddy's: Secret of the Mimic (2025)").
-    - **Do** describe it naturally (e.g., "find information about the 'Secret of the Mimic' game").
+2.  **TIPS GENERATION - "MECHANISM MAPPING"**:
+    - **Logic**: The Tip must explain the **Functional Utility** of the tool used, ensuring the user knows *how* to satisfy the constraint mentioned above.
+    - **Structure**: "TIPS: Use the [UI Component Name] to [Strategic Benefit]."
+    - **Constraint**: Do not mention specific data values (like numbers or proper nouns) in the Tip. Keep it focused on the **tool's capability**.
 
-**Output JSON**:
+3.  **NO VERBATIM TITLES**: 
+    - Describe the target by its **function, category, or content**. Do not copy the exact commercial title string.
+
+4.  **INPUT HONESTY**: 
+    - If user typed text, the Task must explicitly state "Search for [text]...", do not hallucinate terms.
+
+**Output JSON ONLY**:
 {{
-    "visual_evidence": ["Short text string from screen confirming success"],
-    "complex_task": "The natural language instruction."
+    "visual_evidence": ["Short text string from screen verifying success"],
+    "complex_task": "The instruction containing explicit semantic constraints derived from actions.",
+    "tips": "The hint string explaining the tool's utility."
 }}
 """
     content = [{"type": "text", "text": prompt}]
@@ -164,42 +172,25 @@ def prompt_audit_trajectory(
     visual_evidence: str = "None provided"
 ) -> list[dict]:
     
-    # 提取最后一步动作
     last_step = trajectory[-1] if trajectory else {}
     last_action = last_step.get('description', 'Unknown')
     
-    # 提取倒数第二步（辅助判断）
-    prev_step = trajectory[-2] if len(trajectory) > 1 else {}
-    prev_action = prev_step.get('description', 'None')
-
-    prompt = f"""You are a Result-Oriented Task Auditor.
-Your job is to determine if the User's **Final State** and **Last Action** successfully completed the Task.
+    prompt = f"""You are a Lenient Task Evaluator.
+Determine if the User's final state is **semantically aligned** with the Task.
 
 **The Task**: "{task_description}"
+**Last Action**: "{last_action}"
+**Final Visual Evidence**: "{visual_evidence}"
 
-**The Final Evidence**:
-- **Last Action Performed**: "{last_action}"
-- **Previous Action**: "{prev_action}"
-- **Content Visible on Final Screen**: "{visual_evidence}"
+**Evaluation Logic (Lenient)**:
+1. **Semantic Relevance**: Is the user on a page *relevant* to the task? (e.g., If the task is "Find X", and the user is on the detail page of X, it is a PASS).
+2. **Action Consistency**: Did the user's actions lead them here reasonably?
+3. **Implicit Success**: If the user found the correct item/page but didn't explicitly perform the final click (e.g., "Submit", "Download", "Buy", "Play"), but the target is clearly visible and correct, count it as **VALID** for exploration/navigation tasks.
 
-**Audit Rules (Based on Task Type)**:
-
-1. **Type A: Information Seeking (e.g., "Find the price", "Check the date")**
-   - **Criteria**: Does the "Content Visible on Final Screen" contain the answer or the specific entity requested?
-   - **Ignore**: Do NOT judge the search keywords used in early steps. As long as they reached the right page, it is a PASS.
-
-2. **Type B: Operation/Navigation (e.g., "Navigate to...", "Click on...")**
-   - **Criteria**: Does the "Last Action" directly interact with the target?
-   - **Example**: If Task is "Find the Login Page", and Last Action is "Click 'Sign In'", it is a PASS.
-
-**Judgment Logic**:
-- If the final state matches the goal -> **true**.
-- If the user is still searching or on an irrelevant page -> **false**.
-
-**Output**: JSON
+**Output JSON**:
 {{
-    "is_valid": ..., 
-    "reason": "Explain why the final outcome matches the task or not."
+    "is_valid": true/false, 
+    "reason": "Brief explanation."
 }}
 """
     return [{"role": "user", "content": prompt}]
