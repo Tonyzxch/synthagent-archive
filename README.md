@@ -1,4 +1,4 @@
-# SynthAgent_new
+# SynthAgent Archive
 
 This repository is an archival fork of [Browser-Syn](https://github.com/Richar-Du/Browser-Syn). I used it for a research-side exploration around instruction data synthesis for web agents, with most of my changes concentrated in [`evolution_synth.py`](./evolution_synth.py) and [`prompts.py`](./prompts.py).
 
